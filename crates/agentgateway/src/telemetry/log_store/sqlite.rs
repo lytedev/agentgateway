@@ -35,6 +35,12 @@ const INSERT_PAYLOAD_PREFIX: &str = r#"
 INSERT INTO request_log_payloads (log_id, request_prompt_json, response_completion_json)
 "#;
 
+// One row per statement: raw bodies can each be many megabytes, so a multi-row statement
+// would hold a whole batch of them at once.
+const INSERT_RAW_BODIES: &str = r#"
+INSERT INTO request_log_raw_bodies (log_id, request_body, response_body) VALUES (?, ?, ?)
+"#;
+
 fn push_request_log_row(
 	row: &mut query_builder::Separated<'_, Sqlite, &'static str>,
 	record: &StoredRequestLog,
@@ -116,6 +122,18 @@ impl SqliteLogStore {
 				push_request_log_payload_row(&mut row, record, payload);
 			});
 			payloads.build().execute(&mut *tx).await?;
+		}
+
+		for (record, raw_bodies) in records
+			.iter()
+			.filter_map(|record| record.raw_bodies.as_ref().map(|bodies| (record, bodies)))
+		{
+			sqlx::query(INSERT_RAW_BODIES)
+				.bind(&record.id)
+				.bind(raw_bodies.request_body.as_deref())
+				.bind(raw_bodies.response_body.as_deref())
+				.execute(&mut *tx)
+				.await?;
 		}
 		tx.commit().await?;
 		Ok(())
@@ -694,5 +712,139 @@ INSERT INTO request_logs VALUES (
 			])
 		);
 		Ok(())
+	}
+}
+
+#[cfg(test)]
+mod raw_bodies_tests {
+	use bytes::Bytes;
+	use chrono::Utc;
+	use sqlx::Row;
+	use sqlx::sqlite::SqlitePoolOptions;
+
+	use super::SqliteLogStore;
+	use crate::telemetry::log_store::{StoredRequestLog, StoredRequestLogRawBodies};
+
+	async fn in_memory_log_store() -> (SqliteLogStore, sqlx::SqlitePool) {
+		// Every connection to `sqlite::memory:` opens a separate database, so the store and the
+		// assertions must share a single connection.
+		let pool = SqlitePoolOptions::new()
+			.max_connections(1)
+			.connect("sqlite::memory:")
+			.await
+			.unwrap();
+		(SqliteLogStore::from_pool(pool.clone()).await.unwrap(), pool)
+	}
+
+	fn stored_log(id: &str, raw_bodies: Option<StoredRequestLogRawBodies>) -> StoredRequestLog {
+		StoredRequestLog {
+			id: id.to_string(),
+			started_at: Utc::now(),
+			completed_at: Utc::now(),
+			duration_ms: 1,
+			trace_id: None,
+			span_id: None,
+			http_status: Some(200),
+			error: None,
+			gen_ai_operation_name: Some("chat".to_string()),
+			gen_ai_provider_name: Some("anthropic".to_string()),
+			gen_ai_request_model: Some("claude".to_string()),
+			gen_ai_response_model: Some("claude".to_string()),
+			input_tokens: None,
+			output_tokens: None,
+			total_tokens: None,
+			cache_read_input_tokens: None,
+			cache_creation_input_tokens: None,
+			reasoning_tokens: None,
+			time_to_first_token_ms: None,
+			time_per_output_token_ms: None,
+			cost: None,
+			agentgateway_user: None,
+			agentgateway_group: None,
+			user_agent_name: None,
+			has_payload: false,
+			attributes_json: "{}".into(),
+			payload: None,
+			raw_bodies,
+		}
+	}
+
+	#[tokio::test]
+	async fn raw_bodies_round_trip_byte_for_byte_including_bytes_that_are_not_utf8() {
+		let (store, pool) = in_memory_log_store().await;
+		let request_body = Bytes::from_static(br#"{"model":"claude","tools":[]}"#);
+		let response_body_that_is_not_utf8 = Bytes::from_static(&[0x1f, 0x8b, 0xff, 0x00, 0xfe]);
+		store
+			.insert_batch(&[
+				stored_log(
+					"with-bodies",
+					Some(StoredRequestLogRawBodies {
+						request_body: Some(request_body.clone()),
+						response_body: Some(response_body_that_is_not_utf8.clone()),
+					}),
+				),
+				stored_log("without-bodies", None),
+			])
+			.await
+			.unwrap();
+
+		let stored =
+			sqlx::query("SELECT log_id, request_body, response_body FROM request_log_raw_bodies")
+				.fetch_all(&pool)
+				.await
+				.unwrap();
+
+		assert_eq!(
+			stored.len(),
+			1,
+			"only the log that captured bodies may have a row in request_log_raw_bodies"
+		);
+		let stored_log_id: String = stored[0].get("log_id");
+		let stored_request_body: Vec<u8> = stored[0].get("request_body");
+		let stored_response_body: Vec<u8> = stored[0].get("response_body");
+		assert_eq!(stored_log_id, "with-bodies");
+		assert_eq!(
+			stored_request_body,
+			request_body.to_vec(),
+			"the request body must be stored exactly as captured"
+		);
+		assert_eq!(
+			stored_response_body,
+			response_body_that_is_not_utf8.to_vec(),
+			"bodies are stored as bytes, so content that is not UTF-8 (such as a compressed \
+			 body) must survive unchanged"
+		);
+	}
+
+	#[tokio::test]
+	async fn raw_bodies_table_is_created_on_a_database_that_predates_it() {
+		let pool = SqlitePoolOptions::new()
+			.max_connections(1)
+			.connect("sqlite::memory:")
+			.await
+			.unwrap();
+		// A database from before raw bodies existed: only the first migration has run, so
+		// opening it must apply the later ones rather than failing every write.
+		sqlx::raw_sql(include_str!(
+			"sqlite_migrations/0001_create_request_log_schema.sql"
+		))
+		.execute(&pool)
+		.await
+		.unwrap();
+
+		let store = SqliteLogStore::from_pool(pool.clone()).await.unwrap();
+		store
+			.insert_batch(&[stored_log(
+				"after-upgrade",
+				Some(StoredRequestLogRawBodies {
+					request_body: Some(Bytes::from_static(b"{}")),
+					response_body: None,
+				}),
+			)])
+			.await
+			.expect(
+				"opening an existing log database must add request_log_raw_bodies, so that \
+				 enabling raw mode after an upgrade does not fail every write",
+			);
 	}
 }

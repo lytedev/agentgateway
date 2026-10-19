@@ -14,7 +14,7 @@ import { otlpProtocolOptions } from '@/policies/TracingPolicyEditor';
 import type { SchemaHelp } from '@/schemaHelp';
 
 type Preset = 'default' | 'otel';
-type LlmMode = 'default' | 'metadata' | 'full';
+type LlmMode = 'default' | 'metadata' | 'full' | 'raw';
 
 export function AccessLogPolicyEditor(props: {
 	formId?: string;
@@ -204,7 +204,8 @@ export function AccessLogPolicyEditor(props: {
 						options={[
 							{ value: 'default', label: 'Default' },
 							{ value: 'metadata', label: 'Metadata' },
-							{ value: 'full', label: 'Full' }
+							{ value: 'full', label: 'Full' },
+							{ value: 'raw', label: 'Raw bodies' }
 						]}
 						schema={props.help.fieldNode<LoggingPolicy>('LoggingPolicy', 'database.llm')}
 						onChange={setLlmMode}
