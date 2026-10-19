@@ -922,6 +922,17 @@ pub struct RequestSnapshot {
 	pub llm: Option<LLMContext>,
 }
 
+impl RequestSnapshot {
+	/// The complete request body, as `request.body` returns it to access-log expressions.
+	pub fn body_for_access_log(&self) -> Option<Bytes> {
+		BodyView {
+			inspection: self.body.as_ref().map(|body| body.0.clone()),
+			recorded: self.recorded_body.as_ref(),
+		}
+		.bytes()
+	}
+}
+
 #[derive(Debug, Clone, Serialize, cel::DynamicType)]
 #[serde(rename_all = "camelCase")]
 pub struct RequestRef<'a> {
@@ -979,6 +990,17 @@ pub struct ResponseSnapshot {
 	pub recorded_body: Option<RecordedBodyHandle>,
 	pub metadata: Option<TransformationMetadata>,
 	pub proxy: Option<ProxyContext>,
+}
+
+impl ResponseSnapshot {
+	/// The complete response body, as `response.body` returns it to access-log expressions.
+	pub fn body_for_access_log(&self) -> Option<Bytes> {
+		BodyView {
+			inspection: self.body.as_ref().map(|body| body.0.clone()),
+			recorded: self.recorded_body.as_ref(),
+		}
+		.bytes()
+	}
 }
 
 #[derive(Debug, Clone, Serialize, cel::DynamicType)]

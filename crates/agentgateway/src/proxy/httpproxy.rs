@@ -179,8 +179,13 @@ pub fn apply_logging_policy_to_log(log: &mut RequestLog, lp: &frontend::LoggingP
 	}
 	if let Some(database) = &lp.database {
 		log.database_llm = database.llm;
-		if database.llm == Some(frontend::DatabaseLlmMode::Full) {
-			log.cel.ctx().register_log_llm_payload();
+		if let Some(llm_mode) = database.llm {
+			if llm_mode.stores_prompt_and_completion_content() {
+				log.cel.ctx().register_log_llm_payload();
+			}
+			if llm_mode.stores_raw_bodies() {
+				log.cel.ctx().register_log_bodies();
+			}
 		}
 		if !database.add.is_empty() {
 			log.cel.database_fields.add = Arc::new(

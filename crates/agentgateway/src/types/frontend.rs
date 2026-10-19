@@ -341,6 +341,21 @@ pub enum DatabaseLlmMode {
 	Metadata,
 	/// Store LLM metadata and prompt/completion content.
 	Full,
+	/// Store everything `full` stores, plus the complete request and response bodies of each LLM
+	/// request exactly as exchanged with the client, including fields that the normalized
+	/// prompt/completion content omits (such as tool definitions and provider-specific
+	/// parameters). A body larger than the buffer limit is not stored.
+	Raw,
+}
+
+impl DatabaseLlmMode {
+	pub fn stores_prompt_and_completion_content(self) -> bool {
+		matches!(self, DatabaseLlmMode::Full | DatabaseLlmMode::Raw)
+	}
+
+	pub fn stores_raw_bodies(self) -> bool {
+		matches!(self, DatabaseLlmMode::Raw)
+	}
 }
 
 impl LoggingPolicy {

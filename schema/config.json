@@ -10851,6 +10851,11 @@
           "description": "Store LLM metadata and prompt/completion content.",
           "type": "string",
           "const": "full"
+        },
+        {
+          "description": "Store everything `full` stores, plus the complete request and response bodies of each LLM\nrequest exactly as exchanged with the client, including fields that the normalized\nprompt/completion content omits (such as tool definitions and provider-specific\nparameters). A body larger than the buffer limit is not stored.",
+          "type": "string",
+          "const": "raw"
         }
       ]
     },

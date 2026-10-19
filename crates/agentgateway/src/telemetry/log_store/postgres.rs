@@ -10,9 +10,10 @@ use tracing::{error, info, warn};
 use super::{
 	AnalyticsGroup, AnalyticsSummaryRequest, AnalyticsSummaryResponse, AnalyticsTimeBucket,
 	GenAiEntry, GetRequest, GetResponse, GroupBy, GroupByField, LogEntry, LogFilters, PayloadEntry,
-	SearchRequest, SearchResponse, StoredRequestLog, StoredRequestLogPayload, TailRequest,
-	TailResponse, TimeRange, TurnEntry, UsageEntry, analytics_window, attr_filter_values,
-	decode_cursor, encode_cursor, limit, promoted_attribute_column, prompt_preview, turn_kind,
+	SearchRequest, SearchResponse, StoredRequestLog, StoredRequestLogPayload,
+	StoredRequestLogRawBodies, TailRequest, TailResponse, TimeRange, TurnEntry, UsageEntry,
+	analytics_window, attr_filter_values, decode_cursor, encode_cursor, limit,
+	promoted_attribute_column, prompt_preview, turn_kind,
 };
 
 pub struct PostgresLogStore {
@@ -51,6 +52,21 @@ impl PostgresLogStore {
 			}
 			let mut copy = tx.copy_in_raw(COPY_REQUEST_LOG_PAYLOADS).await?;
 			copy.send(payloads.as_bytes()).await?;
+			copy.finish().await?;
+		}
+
+		if records.iter().any(|record| record.raw_bodies.is_some()) {
+			let mut copy = tx.copy_in_raw(COPY_REQUEST_LOG_RAW_BODIES).await?;
+			// Sent one row at a time: raw bodies can each be many megabytes, so buffering a
+			// whole batch before sending would hold all of them at once.
+			let mut row = String::new();
+			for record in records {
+				if let Some(raw_bodies) = &record.raw_bodies {
+					row.clear();
+					push_request_log_raw_bodies_copy_row(&mut row, &record.id, raw_bodies);
+					copy.send(row.as_bytes()).await?;
+				}
+			}
 			copy.finish().await?;
 		}
 		tx.commit().await?;
@@ -329,6 +345,30 @@ fn push_request_log_payload_copy_row(
 	push_copy_json_column(buf, &mut first, payload.response_completion_json.as_ref())?;
 	buf.push('\n');
 	Ok(())
+}
+
+fn push_request_log_raw_bodies_copy_row(
+	buf: &mut String,
+	log_id: &str,
+	raw_bodies: &StoredRequestLogRawBodies,
+) {
+	let mut first = true;
+	push_copy_text_column(buf, &mut first, Some(log_id));
+	push_copy_bytea_column(buf, &mut first, raw_bodies.request_body.as_deref());
+	push_copy_bytea_column(buf, &mut first, raw_bodies.response_body.as_deref());
+	buf.push('\n');
+}
+
+fn push_copy_bytea_column(buf: &mut String, first: &mut bool, value: Option<&[u8]>) {
+	push_copy_column_separator(buf, first);
+	let Some(value) = value else {
+		buf.push_str(r"\N");
+		return;
+	};
+	// Postgres reads `\x` followed by hex digits as bytea; COPY's text format needs the
+	// backslash itself escaped. Hex digits never need escaping.
+	buf.push_str(r"\\x");
+	buf.push_str(&hex::encode(value));
 }
 
 fn push_copy_text_column(buf: &mut String, first: &mut bool, value: Option<&str>) {
@@ -622,6 +662,10 @@ COPY request_logs (
 
 const COPY_REQUEST_LOG_PAYLOADS: &str = r#"
 COPY request_log_payloads (log_id, request_prompt_json, response_completion_json) FROM STDIN
+"#;
+
+const COPY_REQUEST_LOG_RAW_BODIES: &str = r#"
+COPY request_log_raw_bodies (log_id, request_body, response_body) FROM STDIN
 "#;
 
 const SELECT_LOGS: &str = r#"

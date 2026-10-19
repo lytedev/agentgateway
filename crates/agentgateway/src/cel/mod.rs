@@ -188,6 +188,18 @@ impl ContextBuilder {
 		self.logging_attributes |=
 			Attributes::Llm | Attributes::LlmCompletion | Attributes::LlmToolCalls;
 	}
+	/// Request recording of the complete request and response bodies for the database log sink
+	/// without requiring a CEL expression to also emit them as attributes.
+	pub fn register_log_bodies(&mut self) {
+		self.logging_attributes |= Attributes::Request
+			| Attributes::RequestBody
+			| Attributes::Response
+			| Attributes::ResponseBody;
+	}
+	pub fn needs_log_bodies(&self) -> bool {
+		self.logging_attributes.contains(Attributes::RequestBody)
+			&& self.logging_attributes.contains(Attributes::ResponseBody)
+	}
 	fn any_has(&self, attr: impl Into<FlagSet<Attributes>>) -> bool {
 		let x = attr.into();
 		self.request_attributes.contains(x)

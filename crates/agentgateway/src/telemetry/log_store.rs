@@ -4,6 +4,7 @@ use std::sync::{Arc, OnceLock};
 use std::time::Instant;
 use std::{env, thread};
 
+use bytes::Bytes;
 use chrono::{DateTime, Duration, Utc};
 use crossbeam::channel::{Receiver, Sender, TryRecvError};
 use serde::{Deserialize, Serialize};
@@ -335,6 +336,7 @@ async fn process_log_store_msg(
 				pending.llm_response.as_ref(),
 			);
 			record.has_payload = record.payload.is_some();
+			record.raw_bodies = pending.raw_bodies;
 			batch.push(record);
 			false
 		},
@@ -391,6 +393,7 @@ pub(super) struct PendingRequestLog {
 	pub llm_mode: Option<crate::types::frontend::DatabaseLlmMode>,
 	pub input_messages: Option<Arc<Vec<agent_llm::types::NormalizedMessage>>>,
 	pub llm_response: Option<crate::cel::LLMContext>,
+	pub raw_bodies: Option<StoredRequestLogRawBodies>,
 }
 
 #[derive(Clone, Debug)]
@@ -417,12 +420,21 @@ pub struct StoredRequestLog {
 	pub has_payload: bool,
 	pub attributes_json: Box<str>,
 	pub payload: Option<StoredRequestLogPayload>,
+	pub raw_bodies: Option<StoredRequestLogRawBodies>,
 }
 
 #[derive(Clone, Debug)]
 pub struct StoredRequestLogPayload {
 	pub request_prompt_json: Option<Value>,
 	pub response_completion_json: Option<Value>,
+}
+
+/// Request and response bodies exactly as exchanged with the client, stored apart from the
+/// normalized payload so that listing logs never reads them.
+#[derive(Clone, Debug, PartialEq)]
+pub struct StoredRequestLogRawBodies {
+	pub request_body: Option<Bytes>,
+	pub response_body: Option<Bytes>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]

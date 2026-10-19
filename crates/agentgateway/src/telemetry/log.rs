@@ -149,7 +149,9 @@ pub(super) fn database_llm_payload(
 	if mode == Some(crate::types::frontend::DatabaseLlmMode::Metadata) {
 		return None;
 	}
-	let request_prompt_json = if mode == Some(crate::types::frontend::DatabaseLlmMode::Full) {
+	let stores_prompt_and_completion_content =
+		mode.is_some_and(|mode| mode.stores_prompt_and_completion_content());
+	let request_prompt_json = if stores_prompt_and_completion_content {
 		input_messages
 			.and_then(|messages| serde_json::to_value(messages).ok())
 			.or_else(|| {
@@ -164,7 +166,7 @@ pub(super) fn database_llm_payload(
 			.as_ref()
 			.and_then(|prompt| serde_json::to_value(prompt.as_ref()).ok())
 	};
-	let response_completion_json = if mode == Some(crate::types::frontend::DatabaseLlmMode::Full) {
+	let response_completion_json = if stores_prompt_and_completion_content {
 		info.and_then(|info| {
 			// Response capture exposes visible text and structured tool calls separately. Recombine them
 			// into the same provider-neutral message shape used for the stored request.
@@ -205,6 +207,25 @@ pub(super) fn database_llm_payload(
 		log_store::StoredRequestLogPayload {
 			request_prompt_json,
 			response_completion_json,
+		},
+	)
+}
+
+pub(super) fn database_raw_bodies(
+	mode: Option<crate::types::frontend::DatabaseLlmMode>,
+	is_llm_request: bool,
+	request: Option<&cel::RequestSnapshot>,
+	response: Option<&cel::ResponseSnapshot>,
+) -> Option<log_store::StoredRequestLogRawBodies> {
+	if !is_llm_request || !mode.is_some_and(|mode| mode.stores_raw_bodies()) {
+		return None;
+	}
+	let request_body = request.and_then(cel::RequestSnapshot::body_for_access_log);
+	let response_body = response.and_then(cel::ResponseSnapshot::body_for_access_log);
+	(request_body.is_some() || response_body.is_some()).then_some(
+		log_store::StoredRequestLogRawBodies {
+			request_body,
+			response_body,
 		},
 	)
 }
@@ -2221,12 +2242,20 @@ impl Drop for DropOnLog {
 						has_payload: false,
 						attributes_json: attributes.json,
 						payload: None,
+						raw_bodies: None,
 					};
+					let raw_bodies = database_raw_bodies(
+						log.database_llm,
+						log.llm_request.is_some(),
+						log.request_snapshot.as_deref(),
+						log.response_snapshot.as_ref(),
+					);
 					log_store::emit(log_store::PendingRequestLog {
 						record,
 						llm_mode: log.database_llm,
 						input_messages: log.input_messages.take(),
 						llm_response,
+						raw_bodies,
 					});
 				}
 			}
@@ -3358,6 +3387,207 @@ mod tests {
 		assert!(!log.cel.cel_context.needs_llm_prompt());
 		assert!(log.cel.cel_context.needs_llm_completion());
 		assert!(log.cel.cel_context.needs_llm_tool_calls());
+	}
+
+	#[test]
+	fn database_llm_raw_enables_prompt_capture_and_body_recording() {
+		let policy: LoggingPolicy = serde_json::from_value(serde_json::json!({
+			"database": {"llm": "raw"}
+		}))
+		.unwrap();
+		let mut log = test_request_log();
+
+		crate::proxy::httpproxy::apply_logging_policy_to_log(&mut log, &policy);
+
+		assert_eq!(log.database_llm, Some(DatabaseLlmMode::Raw));
+		assert!(
+			log.cel.cel_context.needs_llm_completion() && log.cel.cel_context.needs_llm_tool_calls(),
+			"raw mode stores everything full mode stores, so it must capture completions and tool calls"
+		);
+		assert!(
+			log.cel.cel_context.needs_log_bodies(),
+			"raw mode must record request and response bodies so that they exist when the log is written"
+		);
+	}
+
+	#[test]
+	fn database_llm_raw_stores_the_same_normalized_payload_as_full() {
+		let context = llm_context_with_content();
+		let messages = vec![agent_llm::types::NormalizedMessage {
+			role: "user".into(),
+			parts: vec![agent_llm::types::NormalizedMessagePart::text(
+				"hello".into(),
+			)],
+		}];
+
+		let full = database_llm_payload(Some(DatabaseLlmMode::Full), Some(&messages), Some(&context))
+			.expect("full mode stores a normalized payload");
+		let raw = database_llm_payload(Some(DatabaseLlmMode::Raw), Some(&messages), Some(&context))
+			.expect("raw mode must store the normalized payload that the UI's conversation view reads");
+
+		assert_eq!(raw.request_prompt_json, full.request_prompt_json);
+		assert_eq!(raw.response_completion_json, full.response_completion_json);
+	}
+
+	fn streamed_body(chunks: &[&'static [u8]]) -> crate::http::Body {
+		let frames = chunks
+			.iter()
+			.map(|chunk| Ok::<_, crate::http::Error>(http_body::Frame::data(Bytes::from_static(chunk))))
+			.collect::<Vec<_>>();
+		crate::http::Body::new(http_body_util::StreamBody::new(futures_util::stream::iter(
+			frames,
+		)))
+	}
+
+	/// Snapshots a request and response whose bodies are recorded while being streamed through,
+	/// the way the proxy records them for access logging.
+	async fn snapshots_of_streamed_exchange(
+		request_chunks: &[&'static [u8]],
+		response_chunks: &[&'static [u8]],
+		recording_limit: usize,
+	) -> (cel::RequestSnapshot, cel::ResponseSnapshot) {
+		use http_body_util::BodyExt;
+
+		let mut request = ::http::Request::builder()
+			.method(::http::Method::POST)
+			.uri("http://lo/v1/messages")
+			.body(streamed_body(request_chunks))
+			.unwrap();
+		request.body_mut().record(recording_limit);
+		let request_snapshot = cel::snapshot_request(&mut request, false);
+		request.into_body().collect().await.unwrap();
+
+		let mut response = ::http::Response::builder()
+			.status(::http::StatusCode::OK)
+			.body(streamed_body(response_chunks))
+			.unwrap();
+		response.body_mut().record(recording_limit);
+		let response_snapshot = cel::snapshot_response(&mut response);
+		response.into_body().collect().await.unwrap();
+
+		(request_snapshot, response_snapshot)
+	}
+
+	const ANTHROPIC_REQUEST_CHUNKS: &[&[u8]] = &[
+		br#"{"model":"claude","metadata":{"user_id":"session-1"},"#,
+		br#""tools":[{"name":"lookup","input_schema":{}}],"#,
+		br#""messages":[{"role":"user","content":[{"type":"text","text":"hi","cache_control":{"type":"ephemeral"}}]}]}"#,
+	];
+	const ANTHROPIC_RESPONSE_CHUNKS: &[&[u8]] = &[
+		b"event: message_start\ndata: {\"type\":\"message_start\"}\n\n",
+		b"event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
+	];
+
+	#[tokio::test]
+	async fn database_llm_raw_stores_bodies_byte_for_byte_as_exchanged_with_the_client() {
+		let (request, response) = snapshots_of_streamed_exchange(
+			ANTHROPIC_REQUEST_CHUNKS,
+			ANTHROPIC_RESPONSE_CHUNKS,
+			1024 * 1024,
+		)
+		.await;
+
+		let raw_bodies = database_raw_bodies(
+			Some(DatabaseLlmMode::Raw),
+			true,
+			Some(&request),
+			Some(&response),
+		)
+		.expect("raw mode must store the bodies of an LLM request");
+
+		let request_as_sent = ANTHROPIC_REQUEST_CHUNKS.concat();
+		assert_eq!(
+			raw_bodies.request_body.as_deref(),
+			Some(request_as_sent.as_slice()),
+			"the stored request body must be the client's bytes unchanged, including the tool \
+			 definitions, cache_control markers and metadata that normalized prompts omit"
+		);
+		let response_as_sent = ANTHROPIC_RESPONSE_CHUNKS.concat();
+		assert_eq!(
+			raw_bodies.response_body.as_deref(),
+			Some(response_as_sent.as_slice()),
+			"the stored response body must be the complete stream the client received"
+		);
+	}
+
+	#[tokio::test]
+	async fn database_llm_modes_other_than_raw_store_no_bodies() {
+		let (request, response) = snapshots_of_streamed_exchange(
+			ANTHROPIC_REQUEST_CHUNKS,
+			ANTHROPIC_RESPONSE_CHUNKS,
+			1024 * 1024,
+		)
+		.await;
+
+		for mode in [
+			None,
+			Some(DatabaseLlmMode::Metadata),
+			Some(DatabaseLlmMode::Full),
+		] {
+			let raw_bodies = database_raw_bodies(mode, true, Some(&request), Some(&response));
+			assert_eq!(
+				raw_bodies, None,
+				"only raw mode may store request and response bodies, but {mode:?} stored them"
+			);
+		}
+	}
+
+	#[tokio::test]
+	async fn database_llm_raw_stores_no_bodies_for_requests_that_are_not_llm_requests() {
+		let (request, response) = snapshots_of_streamed_exchange(
+			ANTHROPIC_REQUEST_CHUNKS,
+			ANTHROPIC_RESPONSE_CHUNKS,
+			1024 * 1024,
+		)
+		.await;
+
+		let raw_bodies = database_raw_bodies(
+			Some(DatabaseLlmMode::Raw),
+			false,
+			Some(&request),
+			Some(&response),
+		);
+
+		assert_eq!(
+			raw_bodies, None,
+			"the `llm` setting governs LLM traffic only, so other requests on the same listener \
+			 must not have their bodies stored"
+		);
+	}
+
+	#[tokio::test]
+	async fn database_llm_raw_omits_a_body_over_the_buffer_limit_rather_than_storing_it_truncated() {
+		let request_length = ANTHROPIC_REQUEST_CHUNKS.concat().len();
+		let response_length = ANTHROPIC_RESPONSE_CHUNKS.concat().len();
+		assert!(
+			response_length < request_length,
+			"this test needs a limit between the two body lengths"
+		);
+		let (request, response) = snapshots_of_streamed_exchange(
+			ANTHROPIC_REQUEST_CHUNKS,
+			ANTHROPIC_RESPONSE_CHUNKS,
+			response_length,
+		)
+		.await;
+
+		let raw_bodies = database_raw_bodies(
+			Some(DatabaseLlmMode::Raw),
+			true,
+			Some(&request),
+			Some(&response),
+		)
+		.expect("the response fits within the limit, so it must still be stored");
+
+		assert_eq!(
+			raw_bodies.request_body, None,
+			"a request of {request_length} bytes exceeds the {response_length}-byte limit, and a \
+			 truncated body would look complete to anyone reading it, so it must not be stored"
+		);
+		assert_eq!(
+			raw_bodies.response_body.as_deref().map(<[u8]>::len),
+			Some(response_length),
+			"a response exactly at the limit must be stored whole"
+		);
 	}
 
 	#[test]
